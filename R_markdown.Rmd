@@ -1,0 +1,210 @@
+---
+title: "Xgboost_IEEE"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Simple example of parameter optimization of Xgboost through a Bayesian Optimization of ("rBayesianOptimization") package. 
+The example is using a sample of the Vaihingen Dataset based on GEOBIA analysis. The GEOBIA procedures to process Vaihingen and any other raster dataset are documented in detail in : https://github.com/tgrippa/Opensource_OBIA_processing_chain
+
+In this example we use a train and validation set extracted from Vaihingen tile 13. First we optimize the parameters of Xgboost, Support Vector Machines and Random Forest and then measure the predictions of the respective models through a confusion matrix with the validation data.
+
+
+## Call relevant libraries
+```{r installing and calling relevant libraries}
+
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(caret)
+library(rBayesianOptimization)
+library(readr)
+library(Biocomb)
+```
+
+# The data contain several features extracted from the object-based segmentation (i.e., NDVI, VNIR, textures) that are used as input to the classification.
+```{r}
+kfold10 <- read_csv("D:/Xgboos_rev3/Newresults/kfold10.csv")
+testlarge <- read_csv("D:/Xgboos_rev3/Newresults/testlarge.csv")
+
+train=kfold10
+test=testlarge
+```
+
+## Bayesian Optimization of Xgboost  based on 10fold cross-validation. 
+## We predefine 600 trees and provide upper and lower ranges for the rest of the parameters
+
+```{r }
+cv_folds <- KFold(as.matrix(train$Class_Num), nfolds = 10, stratified = TRUE, seed = 0)
+xgb_cv_bayes <- function(max_depth, min_child_weight,eta, subsample,colsample_bytree) { 
+  cv <- xgb.cv(params = list(booster = "dart", eta = eta, 
+                             max_depth = max_depth,
+                             min_child_weight = min_child_weight,
+                             subsample = subsample, colsample_bytree = colsample_bytree, 
+                             label=as.numeric(train$Class_Num),
+                             objective="multi:softmax",
+                             #objective="multi:softmax",
+                             eval_metric="merror",
+                             num_class=4)
+                             ,
+               data = as.matrix(train[,3:104]),label=as.matrix(train$Class_Num),
+               nround=600,
+               folds = cv_folds, prediction = TRUE, showsd = TRUE,
+               early_stopping_rounds = 5,verbose = 0)
+  list(Score = -cv$evaluation_log$test_merror_mean[cv$best_iteration], 
+       Pred = cv$pred)
+}
+OPT_Res <- BayesianOptimization(xgb_cv_bayes,
+                                bounds = list(max_depth = c(2L, 7L),
+                                              min_child_weight = c(1L, 7L),
+                                              subsample = c(0.5, 0.9),
+                                              eta=c(0.005,0.5),
+                                              colsample_bytree=c(0.2,0.5)),
+                                init_grid_dt = NULL, init_points = 10, n_iter = 70,
+                                acq = "ucb", kappa = 2.576, eps = 0.0,
+                                verbose = TRUE)
+
+```
+
+
+# Parametrization of the cost and gamma parameters of SVM based on crossvalidation on exponential sequences.
+In this example we use a coarse sequence but typically, another fine scale search is done around the coarse scale suggested parameters.
+```{r}
+svv_subset=train[,2:104]
+SVM_param1<- tune.svm(Class_Num~., data = svv_subset, sampling = "fix",kernel='radial', 
+                  gamma = 2^(-10:-1), cost = 2^(-4:8))
+SVM_param1
+```
+
+# Parametrization of the number of features sampled at each node for RF classifer
+```{r}
+Tune_rf_1=Tune_rf=tuneRF(as.matrix(train[,3:104]), factor(train$Class_Num), ntreeTry=1000, stepFactor=2, improve=0.05,
+       trace=TRUE, plot=TRUE, doBest=FALSE)
+```
+
+Training the Xgboost classifier with the specified parameters from the Bayesian optmization and measuring the classification accuracy through the validation data.
+
+```{r}
+num_class <- 4
+lb <- as.numeric(train$Class_Num) 
+bst <- xgboost(data = as.matrix(train[,3:104]),print_every_n = 300 ,objective="multi:softmax",eval_metric="merror",nrounds=600,eta=OPT_Res$Best_Par[4],booster="dart",max_depth=OPT_Res$Best_Par[1],min_child_weight=OPT_Res$Best_Par[2],subsample=OPT_Res$Best_Par[3],colsample_bytree=OPT_Res$Best_Par[5],gamma=0.00, num_class = num_class,label=lb)
+pred <- predict(bst, as.matrix(test[,3:104]))
+pred.softmax.df= as.data.frame(pred)
+xtab <- table(pred.softmax.df$pred, test$Class_Num)
+Xgboost_CM=confusionMatrix(xtab)
+Xgboost_CM
+```
+Training the SVM classifier with the specified parameters from the grid search and measuring the classification accuracy through the validation data.
+```{r}
+svm.model <- svm(as.matrix(train[3:104]),train$Class_Num,type="C-classification",gamma=SVM_param1$best.parameters[1],cost=SVM_param1$best.parameters[2])
+svm.pred <- predict(svm.model, as.matrix(test[,3:104]),decision.values = TRUE)
+svmtable=table(svm.pred,test$Class_Num)
+SVM_CM=confusionMatrix(svmtable)
+SVM_CM
+```
+Training the RF classifier parametrized the grid search and measuring the classification accuracy through the validation data. 500 trees were sufficient for this example.
+```{r}
+train_vsurf_rf <- randomForest(as.factor(train$Class_Num) ~ ., data=train[,3:104],ntree=500,mtry=20,importance=TRUE)
+pred=predict(train_vsurf_rf, as.matrix(test[,3:104]))
+rftable2=table(pred,as.factor(test$Class_Num))
+RF_CM=confusionMatrix(rftable2)
+RF_CM
+```
+
+Performing Feature Selection based on the Correlation Based Feature Selection (CFS) method. In this random subset of data, 14 features were selected out of 104.
+```{r}
+CSFS_mat=cbind(as.data.frame(train[ ,3:104]),as.data.frame((train[ ,2])))
+colnames(CSFS_mat)[103] <- "Class_Num"
+CSFS_mat$Class_Num= as.factor(CSFS_mat$Class_Num)
+CSFS1= select.cfs(matrix=CSFS_mat)
+CSFS1$Biomarker= as.character(CSFS1$Biomarker)
+rankking_CSF=CSFS1$Biomarker
+CFS_train <- CSFS_mat[, rankking_CSF]
+CSF_test= testlarge[, rankking_CSF]
+```
+
+
+
+Optimizing Xgboost after CFS feature selection through Bayesian Optimization.
+```{r}
+cv_folds <- KFold(as.matrix(train$Class_Num), nfolds = 10, stratified = TRUE, seed = 0)
+xgb_cv_bayes <- function(max_depth, min_child_weight,eta, subsample,colsample_bytree) { 
+  cv <- xgb.cv(params = list(booster = "dart", eta = eta, 
+                             max_depth = max_depth,
+                             min_child_weight = min_child_weight,
+                             subsample = subsample, colsample_bytree = colsample_bytree, 
+                             label=as.numeric(train$Class_Num),
+                             objective="multi:softmax",
+                             #objective="multi:softmax",
+                             eval_metric="merror",
+                             num_class=4)
+                             ,
+               data = as.matrix(CFS_train[,1:12]),label=as.matrix(train$Class_Num),
+               nround=600,
+               folds = cv_folds, prediction = TRUE, showsd = TRUE,
+               early_stopping_rounds = 5,verbose = 0)
+  list(Score = -cv$evaluation_log$test_merror_mean[cv$best_iteration], 
+       Pred = cv$pred)
+}
+OPT_Res_CFS <- BayesianOptimization(xgb_cv_bayes,
+                                bounds = list(max_depth = c(2L, 7L),
+                                              min_child_weight = c(1L, 7L),
+                                              subsample = c(0.5, 0.9),
+                                              eta=c(0.005,0.5),
+                                              colsample_bytree=c(0.2,0.5)),
+                                init_grid_dt = NULL, init_points = 10, n_iter = 70,
+                                acq = "ucb", kappa = 2.576, eps = 0.0,
+                                verbose = TRUE)
+```
+
+
+
+Training the Xgboost classifier after FS with the specified parameters from the Bayesian optmization and measuring the classification accuracy through the validation data.
+
+```{r}
+num_class <- 4
+lb <- as.numeric(train$Class_Num) 
+bst <- xgboost(data = as.matrix(CFS_train[,1:14]),print_every_n = 300 ,objective="multi:softmax",eval_metric="merror",nrounds=600,eta=OPT_Res_CFS$Best_Par[4],booster="dart",max_depth=OPT_Res_CFS$Best_Par[1],min_child_weight=OPT_Res_CFS$Best_Par[2],subsample=OPT_Res_CFS$Best_Par[3],colsample_bytree=OPT_Res_CFS$Best_Par[5],gamma=0.00, num_class = num_class,label=lb)
+pred <- predict(bst, as.matrix(CSF_test[,1:14]))
+pred.softmax.df= as.data.frame(pred)
+xtab <- table(pred.softmax.df$pred, test$Class_Num)
+Xgboost_CM_CFS=confusionMatrix(xtab)
+Xgboost_CM_CFS
+```
+
+Optimizing Random Forest after Feature Selection
+```{r}
+Tune_RF_CFS=tuneRF(as.matrix(CFS_train[,1:14]), factor(train$Class_Num), ntreeTry=1000, stepFactor=2, improve=0.05,
+       trace=TRUE, plot=TRUE, doBest=FALSE)
+```
+
+
+
+Training the Random Forest classifier after FS with the specified parameters from the Bayesian optmization and measuring the classification accuracy through the validation data.
+```{r}
+train_vsurf_rf <- randomForest(as.factor(train$Class_Num) ~ ., data=CFS_train[,1:14],ntree=500,mtry=6,importance=TRUE)
+pred=predict(train_vsurf_rf, as.matrix(CSF_test[,1:14]))
+rftable2=table(pred,as.factor(test$Class_Num))
+RF_CM_CFS=confusionMatrix(rftable2)
+RF_CM_CFS
+```
+```{r}
+svm_cfs_subset=cbind(CFS_train,train$Class_Num)
+colnames(svm_cfs_subset)[15] <- "Class_Num"
+SVM_param_CFS<- tune.svm(Class_Num~., data = svm_cfs_subset, sampling = "fix",kernel='radial', 
+                  gamma = 2^(-10:-1), cost = 2^(-4:8))
+SVM_param_CFS
+```
+
+Training the Random Forest classifier after FS with the specified parameters from the Bayesian optmization and measuring the classification accuracy through the validation data.
+```{r}
+svm.model <- svm(as.matrix(svm_cfs_subset[,1:14]),train$Class_Num,type="C-classification",gamma=SVM_param_CFS$best.parameters[1],cost=SVM_param_CFS$best.parameters[2])
+svm.pred <- predict(svm.model, as.matrix(CSF_test[,1:14]),decision.values = TRUE)
+svmtable=table(svm.pred,test$Class_Num)
+SVM_CM_CFS=confusionMatrix(svmtable)
+SVM_CM_CFS
+```
+
