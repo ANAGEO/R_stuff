@@ -1,0 +1,82 @@
+---
+title: "Land Use Feature Selection, Random Forest Optimization, Classification and Validation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### The following code in this document describes the actions that were taken in order to process, optimize, train, predict and validate the Land Use classification for the city of Ouagadougou. The same approach was applied for the Dakar.
+
+### The code assumes the training and testing data have already been prepared.
+
+
+### Import relevant libraries for the task at hand
+```{r}
+library(randomForest)
+library(xgboost)
+library(caret)
+library(VSURF)
+library(foreign)
+library(rgdal)
+```
+
+### Load training and validation blocks. Column name "label" refers to the class of the block while information from column 8 and onwards are the independant variables
+
+
+```{r}
+library(readr)
+train <- read_csv("Datasets/Finaldataset/train.csv")
+test <- read_csv("Datasets/Finaldataset/test.csv")
+alldata <- read_csv("Datasets/Finaldataset/alldata.csv")
+head(summary(train))
+```
+
+### Perform Feature Selection based on the VSURF algorithm (Genuer et al. 2015). The output is a feature subset with the least amount of possible features, devoid of redundancy while mainting similar if not better predictive capabilities.
+```{r}
+library(VSURF)
+surf=VSURF(as.factor(train$label) ~ ., norm.votes=FALSE, data=train[,8:96],ncores=16,parallel=TRUE)
+index=colnames(train[surf$varselect.pred+7])
+print(index)
+```
+
+### Fine tuning the "mtry" parameter of the RF using crossvalidation of the Out of Bag (OOB) error.
+```{r}
+set.seed(2)          
+res <- tuneRF(x = train[,index],y = as.factor(train$label),ntreeTry = 2000)
+mtry_opt <- res[,"mtry"][which.min(res[,"OOBError"])]
+```
+###Train the feature optimized and parameter fine-tuned RF model. In the end the Overall Accuracy (OA) based on the test set is computed along with several other class metrics
+
+```{r}
+library(e1071)
+set.seed(11)
+rf_train=randomForest(as.factor(train$label) ~ ., data=train[,index],ntree=2000,mtry=4,importance=TRUE)
+pred=predict(rf_train, as.matrix(test[,index]))
+rftable=table(pred,as.factor(test$label))
+rf_CM=confusionMatrix(rftable)
+print(rf_CM)
+
+
+```
+
+
+### Predict in the whole dataset of Ouagadougou and save the results in a csv. Both class probabilities and the final label are computed.
+```{r}
+
+pred_all=predict(rf_train, as.matrix(alldata[,index]))
+rf_pred_final=cbind(pred_all,alldata[1],alldata[2])
+write.csv(rf_pred_final, file = "Predictions_VSURF.csv")
+pred_all=predict(rf_train, as.matrix(alldata[,index]),type="prob")
+rf_pred_final=cbind(pred_all,alldata[1],alldata[2])
+write.csv(rf_pred_final, file = "Predictions_VSURF_SOFTPROB.csv")
+```
+
+### Save feature importances 
+```{r}
+f_importnace= rf_train$importance
+write.csv(f_importnace, file="Feature_importance_Final.csv")
+```
+
+
